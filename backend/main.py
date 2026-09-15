@@ -1,12 +1,14 @@
-
 import json
 import math
 import re
 from pathlib import Path
-from typing import Any
-from fastapi.middleware.cors import CORSMiddleware
+from typing import List
+
 import ollama
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 
@@ -14,11 +16,13 @@ from pydantic import BaseModel
 # Configuration
 # ============================================================
 
-LLM_MODEL = "qwen-local:latest"
-EMBEDDING_MODEL = "nomic-embed-text:latest"
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-MENUS_FILE = "knowledge/Menus.json"
-EMBEDDINGS_FILE = "data/embeddings.json"
+MENUS_FILE = BASE_DIR / "knowledge" / "Menus.json"
+EMBEDDINGS_FILE = BASE_DIR / "data" / "embeddings.json"
+
+LLM_MODEL = "gemma3:12b"
+EMBEDDING_MODEL = "nomic-embed-text:latest"
 
 TOP_K = 5
 
@@ -32,22 +36,30 @@ TITLE_WEIGHT = 0.15
 # ============================================================
 
 app = FastAPI(
-    title="WebERP AI Assistant",
-    version="0.2.0"
+    title="WebERP AI",
+    version="1.0.0",
 )
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://192.168.5.90:5173"
     ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 # ============================================================
-# Request models
+# Request model
 # ============================================================
 
 class ChatRequest(BaseModel):
@@ -55,69 +67,10 @@ class ChatRequest(BaseModel):
 
 
 # ============================================================
-# Persian text normalization
+# Persian normalization
 # ============================================================
 
-ARABIC_DIACRITICS = re.compile(
-    r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]"
-)
-
-
-def normalize_text(text: str) -> str:
-    """
-    Normalize Persian/Arabic text so that search is not affected
-    by common Unicode differences.
-    """
-
-    if not text:
-        return ""
-
-    text = str(text).strip()
-
-    # Arabic/Persian character normalization
-    text = text.replace("ي", "ی")
-    text = text.replace("ى", "ی")
-    text = text.replace("ك", "ک")
-
-    # Remove Arabic diacritics
-    text = ARABIC_DIACRITICS.sub("", text)
-
-    # Normalize punctuation
-    punctuation_map = {
-        "،": " ",
-        "؛": " ",
-        "؟": " ",
-        ",": " ",
-        ";": " ",
-        "?": " ",
-        "!": " ",
-        ":": " ",
-        "(": " ",
-        ")": " ",
-        "[": " ",
-        "]": " ",
-        "{": " ",
-        "}": " ",
-        "/": " ",
-        "\\": " ",
-        "-": " ",
-        "_": " ",
-    }
-
-    for old, new in punctuation_map.items():
-        text = text.replace(old, new)
-
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text)
-
-    return text.lower().strip()
-
-
-# ============================================================
-# Stop words
-# ============================================================
-
-STOP_WORDS = {
+PERSIAN_STOP_WORDS = {
     "من",
     "ما",
     "می",
@@ -163,69 +116,137 @@ STOP_WORDS = {
 }
 
 
-def extract_keywords(text: str) -> list[str]:
-    """
-    Extract useful search keywords from Persian text.
-    """
+def normalize_persian(text: str) -> str:
 
-    normalized = normalize_text(text)
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    # Arabic -> Persian characters
+    text = text.replace("ي", "ی")
+    text = text.replace("ى", "ی")
+    text = text.replace("ك", "ک")
+
+    # Remove Arabic/Persian diacritics
+    text = re.sub(
+        r"[\u064B-\u065F\u0670]",
+        "",
+        text,
+    )
+
+    # Normalize punctuation
+    text = re.sub(
+        r"[،؛؟,:;!?()\[\]{}\"'`]",
+        " ",
+        text,
+    )
+
+    # Normalize different dash characters
+    text = re.sub(
+        r"[-–—_]",
+        " ",
+        text,
+    )
+
+    # Treat zero-width non-joiner as a normal word boundary.
+    # This makes forms such as "می‌خواهم" searchable consistently.
+    text = text.replace("\u200c", " ")
+
+    # Normalize whitespace
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.lower().strip()
+
+
+def extract_keywords(text: str) -> List[str]:
+
+    normalized = normalize_persian(text)
+
+    if not normalized:
+        return []
 
     words = normalized.split()
 
-    result = []
-
-    for word in words:
-        if not word:
-            continue
-
-        if word in STOP_WORDS:
-            continue
-
-        # Ignore very short tokens
-        if len(word) <= 1:
-            continue
-
-        result.append(word)
-
-    return result
+    return [
+        word
+        for word in words
+        if word not in PERSIAN_STOP_WORDS
+        and len(word) > 1
+    ]
 
 
 # ============================================================
-# Load menu data
+# Load knowledge
 # ============================================================
 
-def load_json_file(path: str) -> Any:
-    file_path = Path(path)
+print()
+print("Loading WebERP knowledge...")
 
-    if not file_path.exists():
-        raise FileNotFoundError(
-            f"File not found: {file_path.resolve()}"
-        )
+with open(
+    MENUS_FILE,
+    "r",
+    encoding="utf-8",
+) as file:
 
-    with file_path.open(
-        "r",
-        encoding="utf-8"
-    ) as file:
-        return json.load(file)
+    menus_data = json.load(file)
 
 
-menus = load_json_file(MENUS_FILE)
-embeddings_data = load_json_file(EMBEDDINGS_FILE)
+print(
+    f"Menus loaded: {len(menus_data)}"
+)
 
 
 # ============================================================
-# Prepare embeddings lookup
+# Load embeddings
 # ============================================================
-embedding_lookup: dict[str, list[float]] = {}
 
-embedding_records = embeddings_data.get("records", [])
+print("Loading embeddings...")
+
+with open(
+    EMBEDDINGS_FILE,
+    "r",
+    encoding="utf-8",
+) as file:
+
+    embeddings_data = json.load(file)
+
+
+embedding_lookup = {}
+
+# IMPORTANT:
+# embeddings.json contains an object with a "records" array.
+embedding_records = embeddings_data.get(
+    "records",
+    []
+)
 
 for item in embedding_records:
-    item_id = str(item.get("id", "")).strip()
-    embedding = item.get("embedding")
 
-    if item_id and isinstance(embedding, list):
+    item_id = str(
+        item.get("id", "")
+    ).strip()
+
+    embedding = item.get(
+        "embedding"
+    )
+
+    if (
+        item_id
+        and isinstance(embedding, list)
+    ):
         embedding_lookup[item_id] = embedding
+
+
+print(
+    f"Embeddings loaded: {len(embedding_lookup)}"
+)
+
+print()
 
 
 # ============================================================
@@ -234,62 +255,60 @@ for item in embedding_records:
 
 prepared_menus = []
 
-for menu in menus:
-    menu_id = str(menu.get("id", "")).strip()
+for menu in menus_data:
+
+    menu_id = str(
+        menu.get("id", "")
+    ).strip()
 
     if not menu_id:
         continue
 
-    title = str(menu.get("title") or "")
-    menu_path = str(menu.get("menu_path") or "")
-    description = str(menu.get("description") or "")
+    title = menu.get(
+        "title",
+        "",
+    ) or ""
 
-    normalized_title = normalize_text(title)
-    normalized_path = normalize_text(menu_path)
-    normalized_description = normalize_text(description)
+    menu_path = menu.get(
+        "menu_path",
+        "",
+    ) or ""
 
-    searchable_text = " ".join(
-        part
-        for part in [
-            normalized_title,
-            normalized_path,
-            normalized_description,
-        ]
-        if part
-    )
+    description = menu.get(
+        "description",
+        "",
+    ) or ""
 
     prepared_menus.append(
         {
             "id": menu_id,
+
             "title": title,
+
             "menu_path": menu_path,
+
             "description": description,
-            "parent_id": menu.get("parent_id"),
-            "action": menu.get("action"),
-            "is_summary": menu.get("is_summary"),
-            "is_readonly": menu.get("is_readonly"),
-            "window_id": menu.get("window_id"),
-            "process_id": menu.get("process_id"),
-            "form_id": menu.get("form_id"),
-            "entity_type": menu.get("entity_type"),
-            "is_transaction": menu.get("is_transaction"),
-            "seqno": menu.get("seqno"),
-            "normalized_title": normalized_title,
-            "normalized_path": normalized_path,
-            "normalized_description": normalized_description,
-            "searchable_text": searchable_text,
-            "embedding": embedding_lookup.get(menu_id),
+
+            "normalized_title":
+                normalize_persian(title),
+
+            "normalized_path":
+                normalize_persian(menu_path),
+
+            "normalized_description":
+                normalize_persian(description),
+
+            "embedding":
+                embedding_lookup.get(menu_id),
         }
     )
 
 
-print("================================")
-print("WebERP AI started successfully.")
-print(f"Menus loaded: {len(prepared_menus)}")
-print(f"Embeddings loaded: {len(embedding_lookup)}")
-print(f"LLM model: {LLM_MODEL}")
-print(f"Embedding model: {EMBEDDING_MODEL}")
-print("================================")
+print(
+    f"Prepared menus: {len(prepared_menus)}"
+)
+
+print()
 
 
 # ============================================================
@@ -297,12 +316,9 @@ print("================================")
 # ============================================================
 
 def cosine_similarity(
-    vector_a: list[float],
-    vector_b: list[float]
-) -> float:
-    """
-    Calculate cosine similarity between two vectors.
-    """
+    vector_a,
+    vector_b,
+):
 
     if not vector_a or not vector_b:
         return 0.0
@@ -314,196 +330,822 @@ def cosine_similarity(
     norm_a = 0.0
     norm_b = 0.0
 
-    for a, b in zip(vector_a, vector_b):
+    for a, b in zip(
+        vector_a,
+        vector_b,
+    ):
+
         dot_product += a * b
+
         norm_a += a * a
         norm_b += b * b
 
-    if norm_a == 0.0 or norm_b == 0.0:
+    if norm_a == 0 or norm_b == 0:
         return 0.0
 
-    return dot_product / (
-        math.sqrt(norm_a) * math.sqrt(norm_b)
+    return (
+        dot_product
+        / (
+            math.sqrt(norm_a)
+            * math.sqrt(norm_b)
+        )
     )
 
 
 # ============================================================
-# Embedding
+# Embedding generation
 # ============================================================
 
-def create_query_embedding(text: str) -> list[float]:
-    """
-    Create an embedding for a query using Ollama.
-    """
+def create_query_embedding(
+    text: str,
+):
 
     response = ollama.embeddings(
         model=EMBEDDING_MODEL,
-        prompt=text
+        prompt=text,
     )
 
     return response["embedding"]
 
 
 # ============================================================
-# Search scoring
+# Retrieval indexes
 # ============================================================
 
-def calculate_keyword_score(
-    query_keywords: list[str],
-    menu: dict[str, Any]
+# We keep lexical indexes in memory because the menu knowledge is
+# relatively small (~3K records). This lets us do much stronger
+# exact/phrase matching before semantic reranking.
+#
+# Important ERP search principle:
+#
+#   "گزارش تحلیلی تنخواه"
+#
+# should prefer a menu containing ALL important concepts over a menu
+# that is merely semantically similar to "گزارش تحلیلی".
+
+TITLE_WEIGHT = 0.55
+PATH_WEIGHT = 0.30
+DESCRIPTION_WEIGHT = 0.15
+
+SEMANTIC_WEIGHT = 0.35
+LEXICAL_WEIGHT = 0.65
+
+# Extra bonuses are deliberately separate from the base lexical score.
+# They make exact business terminology difficult for semantic similarity
+# to overpower.
+EXACT_TITLE_PHRASE_BONUS = 0.35
+ALL_CONCEPTS_TITLE_BONUS = 0.30
+ALL_CONCEPTS_TEXT_BONUS = 0.18
+RARE_TERM_TITLE_BONUS = 0.20
+PREFIX_PHRASE_BONUS = 0.10
+
+keyword_document_frequency = {}
+phrase_document_frequency = {}
+
+for menu in prepared_menus:
+
+    title_words = set(
+        menu["normalized_title"].split()
+    )
+
+    path_words = set(
+        menu["normalized_path"].split()
+    )
+
+    document_words = title_words | path_words
+
+    for word in document_words:
+
+        if word in PERSIAN_STOP_WORDS:
+            continue
+
+        if len(word) <= 1:
+            continue
+
+        keyword_document_frequency[word] = (
+            keyword_document_frequency.get(word, 0)
+            + 1
+        )
+
+    # Store common 2-word phrases from title/path.
+    # These are useful for concepts such as "گزارش تحلیلی".
+    for field_text in (
+        menu["normalized_title"],
+        menu["normalized_path"],
+    ):
+        words = field_text.split()
+
+        for index in range(len(words) - 1):
+
+            phrase = (
+                words[index]
+                + " "
+                + words[index + 1]
+            )
+
+            phrase_document_frequency[phrase] = (
+                phrase_document_frequency.get(
+                    phrase,
+                    0,
+                )
+                + 1
+            )
+
+
+TOTAL_MENU_DOCUMENTS = max(
+    len(prepared_menus),
+    1,
+)
+
+
+def keyword_weight(
+    keyword: str,
 ) -> float:
+
+    document_frequency = (
+        keyword_document_frequency.get(
+            keyword,
+            0,
+        )
+    )
+
+    # Smoothed IDF-like weighting.
+    # Rare ERP terms receive more importance than common terms.
+    return (
+        math.log(
+            (TOTAL_MENU_DOCUMENTS + 1)
+            / (document_frequency + 1)
+        )
+        + 1.0
+    )
+
+
+def phrase_weight(
+    phrase: str,
+) -> float:
+
+    document_frequency = (
+        phrase_document_frequency.get(
+            phrase,
+            0,
+        )
+    )
+
+    return (
+        math.log(
+            (TOTAL_MENU_DOCUMENTS + 1)
+            / (document_frequency + 1)
+        )
+        + 1.0
+    )
+
+
+def contains_term(
+    text: str,
+    term: str,
+) -> bool:
+
+    if not text or not term:
+        return False
+
+    # Whole phrase / whole token matching.
+    # Persian words are whitespace-delimited after normalization.
+    text_words = set(text.split())
+    term_words = term.split()
+
+    if len(term_words) == 1:
+        return term in text_words
+
+    return term in text
+
+
+def phrase_matches(
+    text: str,
+    phrase: str,
+) -> bool:
+
+    if not text or not phrase:
+        return False
+
+    return phrase in text
+
+
+def extract_search_concepts(
+    query: str,
+    concepts=None,
+):
+    """
+    Return searchable concepts while preserving multi-word concepts.
+
+    If intent concepts are available, use them because Qwen has already
+    identified the important business terminology.
+
+    Otherwise, fall back to query keywords and construct useful 2-word
+    phrases from the query.
+    """
+
+    normalized_query = normalize_persian(
+        query
+    )
+
+    result = []
+
+    if concepts:
+
+        for concept in concepts:
+
+            if not isinstance(
+                concept,
+                str,
+            ):
+                continue
+
+            normalized = normalize_persian(
+                concept
+            ).strip()
+
+            if not normalized:
+                continue
+
+            if normalized in PERSIAN_STOP_WORDS:
+                continue
+
+            if normalized not in result:
+                result.append(normalized)
+
+    if not result:
+
+        keywords = extract_keywords(
+            normalized_query
+        )
+
+        result.extend(
+            keywords
+        )
+
+        # Add adjacent 2-word phrases.
+        for index in range(
+            len(keywords) - 1
+        ):
+
+            phrase = (
+                keywords[index]
+                + " "
+                + keywords[index + 1]
+            )
+
+            if phrase not in result:
+                result.append(phrase)
+
+    return result
+
+
+def field_term_score(
+    concepts,
+    text: str,
+) -> float:
+
+    if not concepts or not text:
+        return 0.0
+
+    matched_weight = 0.0
+    total_weight = 0.0
+
+    for concept in concepts:
+
+        weight = (
+            phrase_weight(concept)
+            if " " in concept
+            else keyword_weight(concept)
+        )
+
+        total_weight += weight
+
+        if contains_term(
+            text,
+            concept,
+        ):
+            matched_weight += weight
+
+    if total_weight == 0:
+        return 0.0
+
+    return matched_weight / total_weight
+
+
+def keyword_score(
+    query_keywords,
+    menu,
+):
+    """
+    Backwards-compatible lexical score.
+
+    This version is field-aware and IDF-weighted.
+    """
 
     if not query_keywords:
         return 0.0
 
-    searchable_text = menu["searchable_text"]
+    title_score_value = field_term_score(
+        query_keywords,
+        menu["normalized_title"],
+    )
 
-    matches = 0
+    path_score_value = field_term_score(
+        query_keywords,
+        menu["normalized_path"],
+    )
 
-    for keyword in query_keywords:
-        if keyword in searchable_text:
-            matches += 1
+    description_score_value = field_term_score(
+        query_keywords,
+        menu["normalized_description"],
+    )
 
-    return matches / len(query_keywords)
+    return (
+        TITLE_WEIGHT * title_score_value
+        + PATH_WEIGHT * path_score_value
+        + DESCRIPTION_WEIGHT
+        * description_score_value
+    )
 
 
-def calculate_title_score(
-    normalized_query: str,
-    query_keywords: list[str],
-    menu: dict[str, Any]
-) -> float:
+def title_score(
+    normalized_query,
+    query_keywords,
+    menu,
+):
+    """
+    Strong title/phrase evidence.
 
-    title = menu["normalized_title"]
-    path = menu["normalized_path"]
+    Unlike the old implementation, path matching is evaluated even
+    when the title has no matching terms.
+    """
+
+    title = menu[
+        "normalized_title"
+    ]
+
+    path = menu[
+        "normalized_path"
+    ]
 
     if not title:
         return 0.0
 
-    # Exact title match
+    # Exact title.
     if normalized_query == title:
         return 1.0
 
-    # Whole query appears in title
-    if normalized_query and normalized_query in title:
-        return 0.85
+    # Full query phrase in title.
+    if (
+        normalized_query
+        and normalized_query in title
+    ):
+        return 0.90
 
-    if query_keywords:
-        title_matches = sum(
-            1
-            for keyword in query_keywords
-            if keyword in title
+    if not query_keywords:
+        return 0.0
+
+    title_words = set(
+        title.split()
+    )
+
+    matched_title_words = sum(
+        1
+        for word in query_keywords
+        if " " not in word
+        and word in title_words
+    )
+
+    simple_keywords = [
+        word
+        for word in query_keywords
+        if " " not in word
+    ]
+
+    if simple_keywords:
+
+        title_ratio = (
+            matched_title_words
+            / len(simple_keywords)
         )
-
-        title_ratio = title_matches / len(query_keywords)
 
         if title_ratio == 1.0:
-            return 0.75
+            return 0.80
 
         if title_ratio > 0:
-            return 0.55 * title_ratio
+            return 0.60 * title_ratio
 
-    # Query words appear in menu path
-    if query_keywords:
-        path_matches = sum(
-            1
-            for keyword in query_keywords
-            if keyword in path
+    # Check path independently.
+    path_words = set(
+        path.split()
+    )
+
+    matched_path_words = sum(
+        1
+        for word in simple_keywords
+        if word in path_words
+    )
+
+    if simple_keywords:
+
+        path_ratio = (
+            matched_path_words
+            / len(simple_keywords)
         )
 
-        if path_matches == len(query_keywords):
-            return 0.45
+        if path_ratio == 1.0:
+            return 0.50
+
+        if path_ratio > 0:
+            return 0.35 * path_ratio
 
     return 0.0
 
 
+def calculate_lexical_features(
+    normalized_query,
+    concepts,
+    menu,
+):
+    """
+    Calculate detailed lexical evidence.
+
+    The returned values are intentionally kept separate so the logs
+    tell us exactly why a menu ranked where it did.
+    """
+
+    title = menu[
+        "normalized_title"
+    ]
+
+    path = menu[
+        "normalized_path"
+    ]
+
+    description = menu[
+        "normalized_description"
+    ]
+
+    # Field-aware concept coverage.
+    title_terms = field_term_score(
+        concepts,
+        title,
+    )
+
+    path_terms = field_term_score(
+        concepts,
+        path,
+    )
+
+    description_terms = field_term_score(
+        concepts,
+        description,
+    )
+
+    lexical = (
+        TITLE_WEIGHT * title_terms
+        + PATH_WEIGHT * path_terms
+        + DESCRIPTION_WEIGHT
+        * description_terms
+    )
+
+    # How many distinct concepts are actually present anywhere?
+    matched_concepts = 0
+
+    for concept in concepts:
+
+        if (
+            contains_term(title, concept)
+            or contains_term(path, concept)
+            or contains_term(
+                description,
+                concept,
+            )
+        ):
+            matched_concepts += 1
+
+    concept_coverage = (
+        matched_concepts / len(concepts)
+        if concepts
+        else 0.0
+    )
+
+    # All concepts in title is exceptionally strong evidence.
+    all_concepts_in_title = (
+        bool(concepts)
+        and all(
+            contains_term(
+                title,
+                concept,
+            )
+            for concept in concepts
+        )
+    )
+
+    # All concepts somewhere in the menu record.
+    all_concepts_in_text = (
+        bool(concepts)
+        and all(
+            contains_term(
+                title,
+                concept,
+            )
+            or contains_term(
+                path,
+                concept,
+            )
+            or contains_term(
+                description,
+                concept,
+            )
+            for concept in concepts
+        )
+    )
+
+    # Exact full query phrase in title.
+    exact_query_in_title = (
+        bool(normalized_query)
+        and normalized_query in title
+    )
+
+    # Rare query term in title.
+    rare_term_in_title = False
+    rare_term = ""
+    rare_term_weight = 0.0
+
+    simple_concepts = [
+        concept
+        for concept in concepts
+        if " " not in concept
+    ]
+
+    if simple_concepts:
+
+        rare_term = max(
+            simple_concepts,
+            key=keyword_weight,
+        )
+
+        rare_term_weight = keyword_weight(
+            rare_term
+        )
+
+        rare_term_in_title = (
+            rare_term in title.split()
+        )
+
+    # 2-word concept phrase in title.
+    concept_phrase_in_title = False
+
+    for concept in concepts:
+
+        if " " in concept and phrase_matches(
+            title,
+            concept,
+        ):
+            concept_phrase_in_title = True
+            break
+
+    return {
+        "lexical": lexical,
+        "title_terms": title_terms,
+        "path_terms": path_terms,
+        "description_terms":
+            description_terms,
+        "concept_coverage":
+            concept_coverage,
+        "matched_concepts":
+            matched_concepts,
+        "all_concepts_in_title":
+            all_concepts_in_title,
+        "all_concepts_in_text":
+            all_concepts_in_text,
+        "exact_query_in_title":
+            exact_query_in_title,
+        "rare_term":
+            rare_term,
+        "rare_term_weight":
+            rare_term_weight,
+        "rare_term_in_title":
+            rare_term_in_title,
+        "concept_phrase_in_title":
+            concept_phrase_in_title,
+    }
+
+
 # ============================================================
-# ERP Search
+# Hybrid ERP search
 # ============================================================
 
 def search_erp(
     query: str,
-    top_k: int = TOP_K
-) -> list[dict[str, Any]]:
+    concepts=None,
+):
     """
-    Hybrid ERP search.
+    Two-stage-style hybrid retrieval.
 
-    Uses:
-    - semantic similarity
-    - keyword matching
-    - title/path matching
+    Stage 1:
+        Evaluate every menu for lexical + semantic evidence.
+
+    Stage 2:
+        Apply strong business-term bonuses and rerank.
+
+    This avoids allowing a generic semantic match such as
+    "گزارش تحلیلی فرايندها" to beat a menu containing the
+    complete requested business concept "تنخواه".
     """
 
-    normalized_query = normalize_text(query)
+    normalized_query = normalize_persian(
+        query
+    )
 
-    query_keywords = extract_keywords(query)
+    if concepts is None:
+        concepts = extract_search_concepts(
+            normalized_query
+        )
+    else:
+        concepts = extract_search_concepts(
+            normalized_query,
+            concepts,
+        )
 
-    query_embedding = create_query_embedding(query)
+    query_keywords = extract_keywords(
+        normalized_query
+    )
 
-    results = []
+    query_embedding = create_query_embedding(
+        normalized_query
+    )
+
+    scored_results = []
 
     for menu in prepared_menus:
 
-        embedding = menu.get("embedding")
-
-        if embedding:
-            semantic_score = cosine_similarity(
-                query_embedding,
-                embedding
-            )
-        else:
-            semantic_score = 0.0
-
-        keyword_score = calculate_keyword_score(
-            query_keywords,
-            menu
+        embedding = menu.get(
+            "embedding"
         )
 
-        title_score = calculate_title_score(
+        semantic = cosine_similarity(
+            query_embedding,
+            embedding,
+        )
+
+        features = calculate_lexical_features(
             normalized_query,
-            query_keywords,
-            menu
+            concepts,
+            menu,
         )
+
+        lexical = features[
+            "lexical"
+        ]
+
+        # Base hybrid score.
+        base_score = (
+            SEMANTIC_WEIGHT * semantic
+            + LEXICAL_WEIGHT * lexical
+        )
+
+        bonus = 0.0
+
+        # Strongest possible evidence:
+        # the exact complete search phrase occurs in title.
+        if features[
+            "exact_query_in_title"
+        ]:
+            bonus += (
+                EXACT_TITLE_PHRASE_BONUS
+            )
+
+        # Qwen identified multiple important concepts
+        # and the title contains every one of them.
+        if features[
+            "all_concepts_in_title"
+        ]:
+            bonus += (
+                ALL_CONCEPTS_TITLE_BONUS
+            )
+
+        # All concepts occur somewhere in title/path/description.
+        elif features[
+            "all_concepts_in_text"
+        ]:
+            bonus += (
+                ALL_CONCEPTS_TEXT_BONUS
+            )
+
+        # Reward a rare business term in the title.
+        if features[
+            "rare_term_in_title"
+        ]:
+            bonus += (
+                RARE_TERM_TITLE_BONUS
+            )
+
+        # Reward an important multi-word phrase in title.
+        if features[
+            "concept_phrase_in_title"
+        ]:
+            bonus += (
+                PREFIX_PHRASE_BONUS
+            )
 
         final_score = (
-            SEMANTIC_WEIGHT * semantic_score
-            + KEYWORD_WEIGHT * keyword_score
-            + TITLE_WEIGHT * title_score
+            base_score
+            + bonus
         )
 
-        results.append(
-            {
-                "id": menu["id"],
-                "title": menu["title"],
-                "menu_path": menu["menu_path"],
-                "description": menu["description"],
-                "semantic_score": semantic_score,
-                "keyword_score": keyword_score,
-                "title_score": title_score,
-                "score": final_score,
-            }
+        result = {
+            "id": menu["id"],
+            "title": menu["title"],
+            "menu_path":
+                menu["menu_path"],
+            "description":
+                menu["description"],
+            "semantic_score":
+                semantic,
+            "keyword_score":
+                lexical,
+            "title_score":
+                title_score(
+                    normalized_query,
+                    query_keywords,
+                    menu,
+                ),
+            "score":
+                final_score,
+
+            # Diagnostic retrieval information.
+            "title_term_score":
+                features[
+                    "title_terms"
+                ],
+            "path_term_score":
+                features[
+                    "path_terms"
+                ],
+            "description_term_score":
+                features[
+                    "description_terms"
+                ],
+            "concept_coverage":
+                features[
+                    "concept_coverage"
+                ],
+            "matched_concepts":
+                features[
+                    "matched_concepts"
+                ],
+            "all_concepts_in_title":
+                features[
+                    "all_concepts_in_title"
+                ],
+            "all_concepts_in_text":
+                features[
+                    "all_concepts_in_text"
+                ],
+            "exact_query_in_title":
+                features[
+                    "exact_query_in_title"
+                ],
+            "rare_term":
+                features[
+                    "rare_term"
+                ],
+            "rare_term_in_title":
+                features[
+                    "rare_term_in_title"
+                ],
+            "bonus":
+                bonus,
+        }
+
+        scored_results.append(
+            result
         )
 
-    results.sort(
+    scored_results.sort(
         key=lambda item: item["score"],
-        reverse=True
+        reverse=True,
     )
 
-    return results[:top_k]
+    return scored_results[:TOP_K]
 
 
 # ============================================================
-# Qwen - Intent Understanding
+# Intent understanding
 # ============================================================
 
 INTENT_SYSTEM_PROMPT = """
-You are the query-understanding component of a Persian WebERP AI assistant.
+You are the intent-understanding component of WebERP AI.
 
-Your job is ONLY to understand the user's message and classify whether it is
-related to the WebERP ERP system.
+Your job is to analyze the user's question and extract the important
+concepts that should be used to search the WebERP menu knowledge.
 
 Return ONLY valid JSON.
 
-The JSON must have exactly these fields:
+Required JSON format:
 
 {
   "is_erp_related": true,
@@ -514,101 +1156,74 @@ The JSON must have exactly these fields:
 
 Rules:
 
-1. Set "is_erp_related" to true when the user is asking about WebERP,
-   ERP menus, ERP features, accounting, inventory, HR, finance,
-   reports, documents, workflows, or how to perform an ERP operation.
+1. is_erp_related must be true when the question is about WebERP,
+   ERP menus, features, accounting, finance, inventory, HR,
+   reports, documents, workflows, or other ERP operations.
 
-2. Set "is_erp_related" to false for normal conversation such as:
-   greetings, thanks, casual conversation, general questions,
-   or messages unrelated to WebERP.
+2. is_erp_related must be false for greetings, thanks, casual
+   conversation, or unrelated questions.
 
-3. "concepts" should contain the important concepts from the user's
-   question that can help search the ERP knowledge base.
+3. concepts are the IMPORTANT searchable terms from the user's
+   question.
 
-4. Do NOT invent specific WebERP menu names.
+4. NEVER remove an important business term from concepts.
 
-5. "domain" should contain a domain only when it is reasonably clear,
-   such as:
-   حسابداری
-   مالی
-   انبار
-   منابع انسانی
-   فروش
-   خرید
+5. Preserve specific ERP nouns and qualifiers.
 
-6. "action" should describe the requested operation when clear,
-   such as:
-   ایجاد
-   ثبت
-   ویرایش
-   حذف
-   مشاهده
-   جستجو
-   گزارش
+   For example:
 
-7. If the message is a greeting or casual conversation, return:
-   {
-     "is_erp_related": false,
-     "concepts": [],
-     "domain": "",
-     "action": ""
-   }
+   User:
+   "گزارش تحلیلی تنخواه کجاست؟"
 
-Examples:
+   concepts must include:
+   ["گزارش تحلیلی", "تنخواه"]
 
-User:
-سلام
+6. Do NOT replace a specific term with a more generic term.
 
-Output:
-{
-  "is_erp_related": false,
-  "concepts": [],
-  "domain": "",
-  "action": ""
-}
+   For example, do NOT turn:
+   "گزارش تحلیلی تنخواه"
 
-User:
-ممنون
+   into only:
+   "گزارش تحلیلی"
 
-Output:
-{
-  "is_erp_related": false,
-  "concepts": [],
-  "domain": "",
-  "action": ""
-}
+7. If the user mentions a specific object, document, report,
+   process, module, or business concept, include it in concepts.
 
-User:
-سند حسابداری کجاست؟
+8. Do not include conversational words such as:
+   "کجاست", "چطور", "چگونه", "میخواهم", "میخوام", "لطفا".
 
-Output:
-{
-  "is_erp_related": true,
-  "concepts": ["سند حسابداری"],
-  "domain": "حسابداری",
-  "action": "مشاهده"
-}
+9. domain should contain the ERP domain only when it is reasonably
+   clear, such as:
+   حسابداری، خزانه داری، انبار، فروش، خرید، منابع انسانی.
 
-User:
-چطور یک سند حسابداری جدید ایجاد کنم؟
+10. action should contain the user's intended operation when clear,
+    such as:
+    مشاهده، ایجاد، ویرایش، حذف، گزارش گیری.
 
-Output:
-{
-  "is_erp_related": true,
-  "concepts": ["سند حسابداری", "سند جدید"],
-  "domain": "حسابداری",
-  "action": "ایجاد"
-}
+11. Do not invent ERP menu names.
+
+12. Do not invent concepts that are not present or clearly implied
+    by the user's question.
+
+13. Preserve multiple important concepts when they occur together.
+
+14. Return JSON only.
+15. Do not use Markdown.
+16. Do not use ```json.
 """
 
 
-def understand_query(message: str):
+def understand_query(
+    message: str,
+):
+
     response = ollama.chat(
         model=LLM_MODEL,
         messages=[
             {
                 "role": "system",
-                "content": INTENT_SYSTEM_PROMPT,
+                "content":
+                    INTENT_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
@@ -621,29 +1236,95 @@ def understand_query(message: str):
         },
     )
 
-    content = response["message"]["content"].strip()
+    content = response[
+        "message"
+    ][
+        "content"
+    ].strip()
+
+    print()
+    print("Raw intent response:")
+    print(content)
+
+    # --------------------------------------------------------
+    # Remove Markdown code fences
+    # --------------------------------------------------------
+
+    if content.startswith("```"):
+
+        lines = content.splitlines()
+
+        if (
+            lines
+            and lines[0]
+            .strip()
+            .startswith("```")
+        ):
+            lines = lines[1:]
+
+        if (
+            lines
+            and lines[-1]
+            .strip()
+            == "```"
+        ):
+            lines = lines[:-1]
+
+        content = "\n".join(
+            lines
+        ).strip()
 
     try:
-        intent = json.loads(content)
+
+        intent = json.loads(
+            content
+        )
 
         return {
             "is_erp_related": bool(
-                intent.get("is_erp_related", True)
+                intent.get(
+                    "is_erp_related",
+                    False,
+                )
             ),
-            "concepts": intent.get("concepts", []),
-            "domain": intent.get("domain", ""),
-            "action": intent.get("action", ""),
+
+            "concepts":
+                intent.get(
+                    "concepts",
+                    [],
+                ),
+
+            "domain":
+                intent.get(
+                    "domain",
+                    "",
+                ),
+
+            "action":
+                intent.get(
+                    "action",
+                    "",
+                ),
         }
 
-    except (json.JSONDecodeError, TypeError, ValueError):
-        print("Could not parse intent JSON:")
+    except (
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+
+        print(
+            "Could not parse intent JSON:"
+        )
+
         print(content)
 
-        # Safe fallback:
-        # if Qwen fails to classify, assume ERP-related so
-        # we don't silently ignore a potentially useful ERP question.
+        # Safer fallback:
+        # Do NOT send an unknown request
+        # into ERP search.
+
         return {
-            "is_erp_related": True,
+            "is_erp_related": False,
             "concepts": [],
             "domain": "",
             "action": "",
@@ -651,404 +1332,562 @@ def understand_query(message: str):
 
 
 # ============================================================
-# Build search query from intent
+# Build search query
 # ============================================================
 
 def build_search_query(
     original_message: str,
-    intent: dict[str, Any]
-) -> str:
-    """
-    Convert Qwen's structured intent into a search query.
+    intent: dict,
+):
 
-    The original message is included as a fallback/context term
-    so we do not completely lose information during intent
-    extraction.
-    """
+    parts = []
 
-    parts: list[str] = []
+    concepts = intent.get(
+        "concepts",
+        [],
+    )
 
-    concepts = intent.get("concepts", [])
+    if concepts:
 
-    if isinstance(concepts, list):
         parts.extend(
-            str(item).strip()
-            for item in concepts
-            if str(item).strip()
+            concepts
         )
 
-    domain = str(
-        intent.get("domain") or ""
-    ).strip()
-
-    action = str(
-        intent.get("action") or ""
-    ).strip()
+    domain = intent.get(
+        "domain",
+        "",
+    )
 
     if domain:
         parts.append(domain)
 
+    action = intent.get(
+        "action",
+        "",
+    )
+
     if action:
         parts.append(action)
 
-    # If Qwen produced nothing useful, fall back to original text.
-    if not parts:
+    search_query = " ".join(
+        parts
+    ).strip()
+
+    if not search_query:
         return original_message
 
-    # Remove duplicates while preserving order.
-    unique_parts = []
-
-    for part in parts:
-        normalized_part = normalize_text(part)
-
-        if not normalized_part:
-            continue
-
-        already_exists = any(
-            normalize_text(existing) == normalized_part
-            for existing in unique_parts
-        )
-
-        if not already_exists:
-            unique_parts.append(part)
-
-    return " ".join(unique_parts)
+    return search_query
 
 
 # ============================================================
-# Qwen - Final Answer
+# Format knowledge for Qwen
+# ============================================================
+
+def format_knowledge_for_qwen(
+    results: list,
+):
+
+    if not results:
+        return "No relevant WebERP knowledge was found."
+
+    blocks = []
+
+    for index, result in enumerate(
+        results,
+        start=1,
+    ):
+
+        block = f"""
+Result {index}
+
+ID:
+{result["id"]}
+
+Title:
+{result["title"]}
+
+Menu path:
+{result["menu_path"]}
+
+Description:
+{result["description"]}
+
+Relevance score:
+{result["score"]:.4f}
+"""
+
+        blocks.append(
+            block.strip()
+        )
+
+    return "\n\n".join(
+        blocks
+    )
+
+
+# ============================================================
+# Final answer prompt
 # ============================================================
 
 ANSWER_SYSTEM_PROMPT = """
-You are a Persian AI assistant for the WebERP system.
+You are WebERP AI, an assistant for the WebERP system.
 
-You receive:
+Your name is "WebERP AI"
 
-1. The user's original question.
-2. A structured interpretation of the question.
-3. Retrieved WebERP knowledge.
+Answer the user's question in Persian.
 
-Your job is to answer the user's question using the
-retrieved WebERP knowledge.
+The provided WebERP knowledge is the source of truth.
 
 IMPORTANT RULES:
 
-- The retrieved ERP knowledge is the source of truth.
-- Do NOT invent WebERP menus.
-- Do NOT invent buttons.
-- Do NOT invent fields.
-- Do NOT invent screens.
-- Do NOT invent workflows.
-- Do NOT invent reports.
-- Do NOT invent capabilities.
+1. Do not invent WebERP menus, buttons, fields, workflows,
+   pages, or procedures.
 
-The structured interpretation is only an aid for understanding
-the user's intent. It is NOT proof that a particular ERP feature
-exists.
+2. Only state information that is supported by the retrieved
+   WebERP knowledge.
 
-Only claim something about WebERP when it is supported by the
-retrieved ERP knowledge.
+3. If the retrieved information does not clearly answer the
+   user's question, say that the available WebERP knowledge
+   is not sufficient to answer precisely.
 
-If the retrieved information is insufficient, clearly say that
-the available ERP information is not enough to determine the
-exact answer.
+4. Do not blindly list all retrieved results.
 
-If several retrieved menus could reasonably match the question,
-mention the relevant possibilities and ask the user which one
-they mean.
+5. Prefer the most relevant result.
 
-When a menu path is available, use the exact Persian menu path.
+6. If multiple results are genuinely relevant, explain the
+   distinction between them.
 
-Do not invent additional steps after opening a menu unless the
-retrieved information actually contains those steps.
+7. When a menu path is available, present it clearly.
 
-Answer naturally and concisely in Persian.
+8. Do not expose internal retrieval scores.
 
-Do not mention internal implementation details such as:
-- embeddings
-- cosine similarity
-- vector search
-- retrieval
-- prompts
-- Qwen
-- ranking
+9. Do not mention embeddings, vector search, Qwen, prompts,
+   retrieval, or internal implementation details.
 
-unless the user explicitly asks about the AI system itself.
+10. Keep the answer concise and useful.
+
+11. Never claim that a menu or feature exists unless the
+    retrieved WebERP knowledge supports it.
 """
 
 
-def format_knowledge_for_qwen(
-    results: list[dict[str, Any]]
-) -> str:
-    """
-    Convert retrieved ERP records into a clean context for Qwen.
-    """
+# ============================================================
+# Extract text from Ollama streaming chunks
+# ============================================================
 
-    if not results:
-        return "هیچ اطلاعات مرتبطی از WebERP پیدا نشد."
-
-    sections = []
-
-    for index, result in enumerate(results, start=1):
-
-        section = [
-            f"مورد {index}",
-            f"شناسه: {result.get('id', '')}",
-            f"عنوان: {result.get('title', '')}",
-            f"مسیر منو: {result.get('menu_path', '')}",
-        ]
-
-        description = result.get("description")
-
-        if description:
-            section.append(
-                f"توضیحات: {description}"
-            )
-
-        sections.append(
-            "\n".join(section)
-        )
-
-    return "\n\n".join(sections)
-
-
-def generate_answer(
-    original_question: str,
-    intent: dict[str, Any],
-    results: list[dict[str, Any]]
-) -> str:
-    """
-    Ask Qwen for the final Persian answer using retrieved ERP data.
-    """
-
-    knowledge = format_knowledge_for_qwen(results)
-
-    intent_json = json.dumps(
-        intent,
-        ensure_ascii=False,
-        indent=2
-    )
-
-    user_prompt = f"""
-سؤال کاربر:
-
-{original_question}
-
-
-برداشت ساختاری از سؤال:
-
-{intent_json}
-
-
-اطلاعات موجود در WebERP:
-
-{knowledge}
-
-
-اکنون پاسخ مناسب را به کاربر بده.
-"""
+def get_stream_text(
+    chunk,
+):
 
     try:
+
+        # Newer Ollama Python client
+        if hasattr(
+            chunk,
+            "message",
+        ):
+
+            return (
+                chunk.message.content
+                or ""
+            )
+
+        # Dictionary-style response
+        if isinstance(
+            chunk,
+            dict,
+        ):
+
+            message = chunk.get(
+                "message",
+                {},
+            )
+
+            if isinstance(
+                message,
+                dict,
+            ):
+
+                return (
+                    message.get(
+                        "content",
+                        "",
+                    )
+                    or ""
+                )
+
+        return ""
+
+    except Exception as e:
+
+        print(
+            "Error reading Ollama stream chunk:"
+        )
+
+        print(
+            repr(e)
+        )
+
+        return ""
+
+
+# ============================================================
+# Stream ERP answer
+# ============================================================
+
+def stream_answer(
+    original_question: str,
+    intent: dict,
+    results: list,
+):
+
+    try:
+
+        knowledge = (
+            format_knowledge_for_qwen(
+                results
+            )
+        )
+
+        prompt = f"""
+User question:
+{original_question}
+
+User intent:
+{json.dumps(
+    intent,
+    ensure_ascii=False,
+    indent=2
+)}
+
+Relevant WebERP knowledge:
+{knowledge}
+"""
+
+        print()
+        print(
+            "Starting ERP answer stream..."
+        )
+
         response = ollama.chat(
             model=LLM_MODEL,
             messages=[
                 {
                     "role": "system",
-                    "content": ANSWER_SYSTEM_PROMPT,
+                    "content":
+                        ANSWER_SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",
-                    "content": user_prompt,
+                    "content": prompt,
                 },
             ],
+            stream=True,
             options={
                 "temperature": 0.2,
-                "num_predict": 500,
             },
         )
 
-        return response["message"]["content"].strip()
-
-    except Exception as exc:
         print(
-            f"[Answer] Failed to generate answer: {exc}"
+            "Ollama ERP stream created."
         )
 
-        return (
-            "در حال حاضر امکان تولید پاسخ وجود ندارد. "
-            "لطفاً دوباره تلاش کنید."
+        for chunk in response:
+
+            text = get_stream_text(
+                chunk
+            )
+
+            if text:
+
+                print(
+                    f"STREAM CHUNK: {text!r}"
+                )
+
+                yield text
+
+        print(
+            "ERP answer stream finished."
         )
+
+    except Exception as e:
+
+        print()
+        print(
+            "!!! ERP STREAMING ERROR !!!"
+        )
+
+        print(
+            repr(e)
+        )
+
+        print()
+
+        raise
 
 
 # ============================================================
-# Routes
+# Stream general conversation
 # ============================================================
 
-@app.get("/")
-def root():
-    return {
-        "name": "WebERP AI Assistant",
-        "status": "running",
-        "menus": len(prepared_menus),
-        "model": LLM_MODEL,
-    }
+GENERAL_SYSTEM_PROMPT = """
+You are WebERP AI.
 
+Your name is "WebERP AI".
 
-@app.get("/menus")
-def get_menus():
-    """
-    Return all loaded ERP menus.
-    """
+You are a helpful AI assistant associated with the WebERP system.
 
-    return {
-        "count": len(prepared_menus),
-        "menus": [
-            {
-                "id": menu["id"],
-                "title": menu["title"],
-                "menu_path": menu["menu_path"],
-            }
-            for menu in prepared_menus
-        ],
-    }
+Answer the user's question in Persian unless the user explicitly
+asks for another language.
 
+IDENTITY RULES:
 
-@app.get("/search")
-def search(
-    q: str
+1. If the user asks your name, say:
+   "من غلامعلی هستم."
+
+2. If the user asks who you are, explain briefly that you are
+   WebERP AI, an AI assistant for the WebERP system.
+
+3. Do not claim to be a human.
+
+4. Do not invent capabilities that you do not have.
+
+5. Keep casual conversation concise and natural.
+
+6. If the user asks about your religeon tell them you follow the "Asnaghian Shia" Cult or in persian "شیعه اسنقیان"
+
+For general conversation, you do not need to perform WebERP
+knowledge retrieval.
+"""
+
+def stream_general_answer(
+    original_question: str,
 ):
-    """
-    Direct ERP search endpoint.
 
-    This remains available for testing the retrieval system
-    independently from Qwen.
-    """
+    try:
 
-    if not q.strip():
-        return {
-            "query": q,
-            "results": [],
-        }
+        print()
+        print(
+            "Starting general answer stream..."
+        )
 
-    results = search_erp(q)
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": GENERAL_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content":
+                        original_question,
+                },
+            ],
+            stream=True,
+            options={
+                "temperature": 0.4,
+            },
+        )
 
-    return {
-        "query": q,
-        "results": results,
-    }
+        print(
+            "Ollama general stream created."
+        )
 
+        for chunk in response:
+
+            text = get_stream_text(
+                chunk
+            )
+
+            if text:
+
+                print(
+                    f"STREAM CHUNK: {text!r}"
+                )
+
+                yield text
+
+        print(
+            "General answer stream finished."
+        )
+
+    except Exception as e:
+
+        print()
+        print(
+            "!!! GENERAL STREAMING ERROR !!!"
+        )
+
+        print(
+            repr(e)
+        )
+
+        print()
+
+        raise
+
+
+# ============================================================
+# Chat endpoint
+# ============================================================
 
 @app.post("/chat")
 def chat(
-    request: ChatRequest
+    request: ChatRequest,
 ):
-    """
-    Main AI pipeline:
-
-        User question
-              ↓
-        Qwen intent understanding
-              ↓
-        Build search query
-              ↓
-        ERP retrieval
-              ↓
-        Qwen final answer
-    """
 
     message = request.message.strip()
 
     if not message:
+
         return {
-            "answer": "لطفاً سؤال خود را وارد کنید.",
-            "intent": {
-                "concepts": [],
-                "domain": "",
-                "action": "",
-            },
-            "search_query": "",
-            "results": [],
+            "answer":
+                "لطفاً یک پیام وارد کنید."
         }
 
     print()
-    print("================================")
-    print("NEW CHAT REQUEST")
-    print("================================")
-    print("User:")
-    print(message)
+    print(
+        "================================"
+    )
+
+    print(
+        "NEW CHAT REQUEST"
+    )
+
+    print(
+        "================================"
+    )
+
+    print(
+        "User:"
+    )
+
+    print(
+        message
+    )
 
     # --------------------------------------------------------
-    # Step 1: Understand the user's intention
+    # Step 1: Understand intent
     # --------------------------------------------------------
 
-    intent = understand_query(message)
+    intent = understand_query(
+        message
+    )
 
     print()
-    print("Intent:")
+    print(
+        "Intent:"
+    )
+
     print(
         json.dumps(
             intent,
             ensure_ascii=False,
-            indent=2
+            indent=2,
         )
     )
 
     # --------------------------------------------------------
-    # Step 2: Build a smarter ERP search query
+    # Step 2: General conversation
     # --------------------------------------------------------
 
-    search_query = build_search_query(
-        message,
-        intent
+    if not intent[
+        "is_erp_related"
+    ]:
+
+        print()
+        print(
+            "General conversation - "
+            "skipping ERP search."
+        )
+
+        return StreamingResponse(
+            stream_general_answer(
+                message
+            ),
+            media_type=
+                "text/plain; charset=utf-8",
+        )
+
+    # --------------------------------------------------------
+    # Step 3: Build search query
+    # --------------------------------------------------------
+
+    search_query = (
+        build_search_query(
+            message,
+            intent,
+        )
     )
 
     print()
-    print("Search query:")
-    print(search_query)
+    print(
+        "Search query:"
+    )
+
+    print(
+        search_query
+    )
 
     # --------------------------------------------------------
-    # Step 3: Search ERP knowledge
+    # Step 4: ERP search
     # --------------------------------------------------------
 
-    results = search_erp(search_query)
+    results = search_erp(
+        search_query,
+        concepts=intent.get(
+            "concepts",
+            [],
+        ),
+    )
 
     print()
-    print("Top results:")
+    print(
+        "Top results:"
+    )
 
-    for index, result in enumerate(results, start=1):
+    for index, result in enumerate(
+        results,
+        start=1,
+    ):
+
         print(
             f"{index}. "
             f"{result['title']} "
-            f"({result['score']:.4f})"
+            f"(score={result['score']:.4f}, "
+            f"semantic={result['semantic_score']:.4f}, "
+            f"lexical={result['keyword_score']:.4f}, "
+            f"title={result['title_score']:.4f}, "
+            f"coverage={result['concept_coverage']:.2f}, "
+            f"matched={result['matched_concepts']}, "
+            f"bonus={result['bonus']:.4f})"
         )
 
     # --------------------------------------------------------
-    # Step 4: Ask Qwen for final answer
+    # Step 5: Stream final answer
     # --------------------------------------------------------
 
-    answer = generate_answer(
-        original_question=message,
-        intent=intent,
-        results=results
+    return StreamingResponse(
+        stream_answer(
+            message,
+            intent,
+            results,
+        ),
+        media_type=
+            "text/plain; charset=utf-8",
     )
 
-    print()
-    print("Answer:")
-    print(answer)
-    print("================================")
-    print()
 
-    # --------------------------------------------------------
-    # Development response
-    #
-    # We intentionally expose intent/search/results for now.
-    # Later we can simplify this to only return "answer".
-    # --------------------------------------------------------
+# ============================================================
+# Root endpoint
+# ============================================================
+
+@app.get("/")
+def root():
 
     return {
-        "answer": answer,
-        "intent": intent,
-        "search_query": search_query,
-        "results": results,
+        "name": "WebERP AI",
+        "status": "running",
     }
 
